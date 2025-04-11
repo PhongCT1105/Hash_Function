@@ -1,6 +1,6 @@
 import struct
 import hashlib
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 ###############################
 # Step 1: Padding and Splitting
@@ -12,7 +12,7 @@ def sha256_pad(message: bytes) -> bytes:
     """
     m_len = len(message) * 8  # message length in bits
     message += b'\x80'  # Append the 1 bit (as 0x80)
-    # Append 0 bytes until length is 448 mod 512 bits (i.e. 56 mod 64 bytes)
+    # Append 0 bytes until length is 448 mod 512 bits 
     message += b'\x00' * ((56 - (len(message) % 64)) % 64)
     # Append original length as a 64-bit big-endian integer
     message += struct.pack('>Q', m_len)
@@ -63,7 +63,7 @@ def sha256_compress_block(block: bytes, iv: list[int]) -> list[int]:
     assert len(iv) == 8
 
     # Prepare the message schedule array W[0..63]
-    W = list(struct.unpack('>16L', block))  # 16 words from the block
+    W = list(struct.unpack('>16L', block))
     for i in range(16, 64):
         s0 = right_rotate(W[i-15], 7) ^ right_rotate(W[i-15], 18) ^ (W[i-15] >> 3)
         s1 = right_rotate(W[i-2], 17) ^ right_rotate(W[i-2], 19) ^ (W[i-2] >> 10)
@@ -90,115 +90,117 @@ def sha256_compress_block(block: bytes, iv: list[int]) -> list[int]:
         b = a
         a = (temp1 + temp2) & 0xFFFFFFFF
 
-    # Compute the new state: add the compressed chunk to the current hash value
+    # Return new state: add the compressed chunk to the IV.
     return [(iv[i] + val) & 0xFFFFFFFF for i, val in enumerate([a, b, c, d, e, f, g, h])]
 
 #####################################################
-# Step 3: Reduction functions for Parallel Hashing
+# Step 3: Reduction Functions for Parallel Hashing
 #####################################################
 
 def reduce_iv(iv: list[int], block1: list[int], block2: list[int]) -> list[int]:
     """
-    Update IV using the formula: new_IV = IV + (block1 XOR block2) 
-    (performed component-wise modulo 2^32).
+    Update IV using: new_IV = IV + (block1 XOR block2)
+    (Applied component-wise modulo 2^32.)
     """
     return [(iv[i] + (block1[i] ^ block2[i])) & 0xFFFFFFFF for i in range(8)]
 
 def combine_hash_blocks(hash_blocks: list[list[int]], iv: list[int]) -> (list[bytes], list[int]):
-    """
-    Given an array of 256-bit hash outputs (each a list of 8 ints) and an IV,
-    do the following reduction step:
-      1. Compute a new IV using the first two blocks.
-      2. Shift the hash_blocks array to the right by one (i.e. drop the first element).
-      3. Pair adjacent blocks from the shifted array by concatenating their bytes into a 512-bit block.
-         If there is an odd block remaining, pass it along directly.
-    Returns the new block array (list of bytes) and the updated IV.
-    """
-    # Compute new IV if at least two blocks exist:
-    if len(hash_blocks) >= 2:
-        new_iv = reduce_iv(iv, hash_blocks[0], hash_blocks[1])
-    else:
-        new_iv = iv
-
-    # Shift the hash block array to the right by one:
-    shifted = hash_blocks[1:]
-
     new_blocks = []
+    new_iv = iv  # Option: you might decide to update the IV for each pair separately and combine them.
+    # Instead of shifting, iterate over pairs.
     i = 0
-    while i < len(shifted):
-        if i + 1 < len(shifted):
-            # Concatenate two adjacent 256-bit blocks into one 512-bit block
-            b1 = struct.pack(">8I", *shifted[i])
-            b2 = struct.pack(">8I", *shifted[i+1])
-            new_blocks.append(b1 + b2)
+    pair_ivs = []
+    while i < len(hash_blocks):
+        if i + 1 < len(hash_blocks):
+            block1 = hash_blocks[i]
+            block2 = hash_blocks[i + 1]
+            # Compute new IV for this pair.
+            pair_iv = reduce_iv(iv, block1, block2)
+            pair_ivs.append(pair_iv)
+            # Concatenate block1 and block2 into a 512-bit block.
+            new_block = struct.pack(">8I", *block1) + struct.pack(">8I", *block2)
+            new_blocks.append(new_block)
             i += 2
         else:
-            # If odd, pass the remaining 256-bit block (32 bytes) as is.
-            new_blocks.append(struct.pack(">8I", *shifted[i]))
+            # If there's an odd block, pass it along.
+            new_blocks.append(struct.pack(">8I", *hash_blocks[i]))
             i += 1
+
+    # For simplicity, choose the first pair's IV as the new IV (or combine all pair IVs as desired)
+    if pair_ivs:
+        new_iv = pair_ivs[0]
     return new_blocks, new_iv
 
+
+
+
 #####################################################
-# Step 4: The Overall Parallel Reduction Process
+# Step 4: Overall Parallel Reduction Process (with Trace)
 #####################################################
 
-def tree_reduce_parallel(message: bytes, iv: list[int]) -> bytes:
-    """
-    Build the parallel hash as follows:
-     1. Pad and split the message.
-     2. For each 512-bit block, compute a 256-bit hash using sha256_compress_block and the given IV.
-     3. Then perform reduction rounds:
-          a. Compute updated IV using the first two hash outputs.
-          b. Shift the hash outputs one to the right.
-          c. Pair adjacent 256-bit outputs (concatenating them into 512-bit blocks).
-          d. Process each new block with sha256_compress_block using the updated IV.
-          e. In case of an odd block, pass it directly (without hashing).
-     4. Repeat until only one 256-bit hash remains.
-    Return that final hash digest as bytes.
-    """
-    # Pad and split the message
+def tree_reduce_parallel_trace(message: bytes, iv: list[int]) -> dict:
+    trace = {}
+    trace["originalMessage"] = message.decode("utf-8", errors="replace")
     padded = sha256_pad(message)
-    blocks = split_blocks(padded)  # list of 512-bit (64-byte) blocks
+    trace["padded"] = padded.hex()
+    blocks = split_blocks(padded)
+    trace["blocks"] = [blk.hex() for blk in blocks]
 
-    # Stage 1: Process each block independently using the initial IV.
-    hash_outputs = [sha256_compress_block(block, iv) for block in blocks]
+    # Stage 1: Process each block with the given IV in parallel.
+    with ThreadPoolExecutor() as executor:
+        # To preserve order, simply use a list comprehension:
+        futures = [executor.submit(sha256_compress_block, block, iv) for block in blocks]
+        initialHashOutputs = [future.result() for future in futures]
+    trace["initialHashOutputs"] = [struct.pack(">8I", *h).hex() for h in initialHashOutputs]
 
-    # Reduction rounds until only one hash output remains.
+    hash_outputs = initialHashOutputs
+    rounds = []
+    round_number = 0
+    # For very short messages that produce only one block, no rounds occur.
     while len(hash_outputs) > 1:
-        # Compute new IV and new block list from the hash_outputs.
+        round_info = {}
+        round_info["round"] = round_number
+        round_info["inputHashOutputs"] = [struct.pack(">8I", *h).hex() for h in hash_outputs]
         new_blocks, new_iv = combine_hash_blocks(hash_outputs, iv)
+        round_info["computedNewIV"] = struct.pack(">8I", *new_iv).hex()
+        round_info["newBlocks"] = [blk.hex() for blk in new_blocks]
+        
         new_hash_outputs = []
-        # Process each new block
-        for blk in new_blocks:
-            # Our compression function requires 64 bytes; if the block is 64 bytes,
-            # we hash it; if it is only 32 bytes (odd leftover), we simply unpack it.
-            if len(blk) == 64:
-                new_hash_outputs.append(sha256_compress_block(blk, new_iv))
-            elif len(blk) == 32:
-                new_hash_outputs.append(list(struct.unpack(">8I", blk)))
-            else:
-                raise ValueError("Unexpected block length in reduction.")
-        # Update IV and hash_outputs for next round.
+        with ThreadPoolExecutor() as executor:
+            futures = []
+            for blk in new_blocks:
+                if len(blk) == 64:
+                    futures.append(executor.submit(sha256_compress_block, blk, new_iv))
+                elif len(blk) == 32:
+                    # Simply unpack the 256-bit block.
+                    futures.append(executor.submit(lambda b: list(struct.unpack(">8I", b)), blk))
+                else:
+                    raise ValueError("Unexpected block length.")
+            new_hash_outputs = [future.result() for future in futures]
+        round_info["outputHashOutputs"] = [struct.pack(">8I", *h).hex() for h in new_hash_outputs]
+        rounds.append(round_info)
         iv = new_iv
         hash_outputs = new_hash_outputs
+        round_number += 1
 
-    # Final output: convert the 256-bit hash (list of 8 ints) to bytes.
-    final_hash = struct.pack(">8I", *hash_outputs[0])
-    return final_hash
+    final_digest = struct.pack(">8I", *hash_outputs[0]).hex()
+    trace["finalDigest"] = final_digest
+    trace["rounds"] = rounds
 
-###############################
-# Example Usage
-###############################
+    # Debug prints (temporarily)
+    print("DEBUG: Final digest =", final_digest)
+    print("DEBUG: Trace =", trace)
+    
+    return {"finalDigest": final_digest, "trace": trace}
 
-# Define a default initial IV (can be customized)
-default_iv = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
-]
-
+# Example usage for local testing.
 if __name__ == "__main__":
-    # Example message
+    default_iv = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    ]
+    # Example message: 56 bytes "a" + 1 byte "b" (total 57 bytes).
     message = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
-
-    final_digest = tree_reduce_parallel(message, default_iv)
-    print("Final parallel SHA-256 digest:", final_digest.hex())
+    result = tree_reduce_parallel_trace(message, default_iv)
+    print("Final parallel SHA-256 digest:", result["finalDigest"])
+    print("Trace:", result["trace"])
