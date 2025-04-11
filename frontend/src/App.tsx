@@ -39,7 +39,8 @@ function App() {
     setError('');
     setTrace(null);
     try {
-      const response = await axios.post<ApiResponse>('http://localhost:3000/api/hash', {
+      // const response = await axios.post<ApiResponse>('http://localhost:3000/api/hash', {
+        const response = await axios.post<ApiResponse>('https://hash-function-backend.onrender.com/api/hash', {
         input,
       });
       setHash(response.data.finalDigest);
