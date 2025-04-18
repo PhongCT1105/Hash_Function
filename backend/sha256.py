@@ -186,10 +186,6 @@ def tree_reduce_parallel_trace(message: bytes, iv: list[int]) -> dict:
     final_digest = struct.pack(">8I", *hash_outputs[0]).hex()
     trace["finalDigest"] = final_digest
     trace["rounds"] = rounds
-
-    # Debug prints (temporarily)
-    print("DEBUG: Final digest =", final_digest)
-    print("DEBUG: Trace =", trace)
     
     return {"finalDigest": final_digest, "trace": trace}
 
