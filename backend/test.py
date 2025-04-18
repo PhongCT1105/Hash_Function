@@ -65,4 +65,4 @@ def run_all_tests(num_samples=1000, num_buckets=64):
     plt.close()
 
 if __name__ == "__main__":
-    run_all_tests(num_samples=100000)
+    run_all_tests(num_samples=1000000)
